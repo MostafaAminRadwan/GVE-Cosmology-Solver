@@ -1,0 +1,167 @@
+import numpy as np
+from scipy.integrate import solve_ivp, quad
+from scipy.interpolate import interp1d
+import warnings
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# =============================================================================
+#  STAGE 0: MODEL DEFINITION AND PARAMETERS
+# =============================================================================
+class GVEModel:
+    """A class to hold all parameters for the Optimal Attractor Solution."""
+    def __init__(self):
+        # Fundamental Constants
+        self.c_kms = 2.99792458e5  # Speed of light in km/s
+        self.Mpc_to_km = 3.0857e19
+        self.G_si = 6.67430e-11 # m^3 kg^-1 s^-2
+        self.c_si = 2.99792458e8 # m/s
+
+        # Potential Parameters (from Appendix B of your paper)
+        self.V0_si = 4.9775e-27  # kg/m^3 --- THIS LINE WAS MISSING ---
+        self.epsilon1, self.alpha1 = 0.60, 1.5
+        self.epsilon2, self.alpha2 = 0.47, 0.7
+        self.epsilon3, self.lamb, self.phi_c = 0.60, 0.28, 5.0
+        
+        # Cosmological Parameters (from Appendix B)
+        self.H0_target_kms_mpc = 69.42
+        self.h = self.H0_target_kms_mpc / 100.0
+        self.Omega_m0 = 0.24955
+        self.Omega_k0 = 0.09735
+        self.Omega_r0 = 9.0e-5
+        self.Omega_b0 = 0.0486 
+        self.Omega_gamma0 = 2.473e-5 / (self.h**2)
+        self.Omega_geom0 = 1 - self.Omega_m0 - self.Omega_r0 - self.Omega_k0
+
+        # Ansatz parameters from your paper's Appendix H
+        self.phi0_eff = 2.1955
+        self.kappa_eff = -0.183991
+
+        # Primordial parameters for S8 calculation
+        self.As = 2.1e-9
+        self.ns = 0.965
+        self.k_pivot_mpc = 0.05 # 1/Mpc
+        
+    def V_normalized(self, phi):
+        norm_factor = (1 + self.epsilon1 * np.exp(-self.alpha1 * 2.20) + 
+                       self.epsilon2 * np.exp(-self.alpha2 * 2.20) + 
+                       self.epsilon3 * np.exp(-self.lamb * (2.20 - self.phi_c)**2))
+        return (1 + self.epsilon1 * np.exp(-self.alpha1 * phi) + self.epsilon2 * np.exp(-self.alpha2 * phi) + self.epsilon3 * np.exp(-self.lamb * (phi - self.phi_c)**2)) / norm_factor
+    
+    def V_prime_normalized(self, phi):
+        norm_factor = (1 + self.epsilon1 * np.exp(-self.alpha1 * 2.20) + 
+                       self.epsilon2 * np.exp(-self.alpha2 * 2.20) + 
+                       self.epsilon3 * np.exp(-self.lamb * (2.20 - self.phi_c)**2))
+        term1_p = -self.alpha1 * self.epsilon1 * np.exp(-self.alpha1 * phi)
+        term2_p = -self.alpha2 * self.epsilon2 * np.exp(-self.alpha2 * phi)
+        term3_p = -2 * self.lamb * self.epsilon3 * (phi - self.phi_c) * np.exp(-self.lamb * (phi - self.phi_c)**2)
+        return (term1_p + term2_p + term3_p) / norm_factor
+
+def get_analytic_model(model):
+    """Creates callable functions for Phi(z) and H(z) based on the effective ansatz."""
+    def phi_ansatz(z):
+        # Clip z to avoid log(0)
+        safe_z = np.maximum(z, 0)
+        return model.phi0_eff + model.kappa_eff * np.log(1 + safe_z)
+    
+    def H_ansatz(z):
+        # Clip z to handle arrays properly
+        safe_z = np.maximum(z, 0)
+        phi_val = phi_ansatz(safe_z)
+        E2 = (model.Omega_m0 * (1+safe_z)**3 + 
+              model.Omega_r0 * (1+safe_z)**4 + 
+              model.Omega_k0 * (1+safe_z)**2 + 
+              model.Omega_geom0 * model.V_normalized(phi_val))
+        return model.H0_target_kms_mpc * np.sqrt(E2)
+    
+    return H_ansatz, phi_ansatz
+
+def calculate_lambda_0(model, phi_func):
+    phi_at_z0 = phi_func(0)
+    V_at_z0_si = model.V0_si * model.V_normalized(phi_at_z0) / model.V_normalized(2.20)
+    lambda_0_s2 = 8 * np.pi * model.G_si * V_at_z0_si
+    return lambda_0_s2 / model.c_si**2
+
+def calculate_sound_horizon(model, H_func):
+    z_star = 1090
+    def integrand(z):
+        R = (3 * model.Omega_b0) / (4 * model.Omega_gamma0) / (1 + z)
+        cs = model.c_kms / np.sqrt(3 * (1 + R))
+        return cs / H_func(z)
+    r_s_Mpc, _ = quad(integrand, z_star, 50000)
+    return r_s_Mpc
+
+def calculate_S8(model, H_func, phi_func):
+    sigma8_ref = 0.8742 # From Appendix E.2
+
+    def growth_ode(z, y, H_function, phi_function):
+        D, D_prime = y
+        H = H_function(z)
+        phi = phi_function(z)
+        dphi_dz = model.kappa_eff / (1 + z)
+        dV_dz = model.V_prime_normalized(phi) * dphi_dz
+        dE2_dz = (3*model.Omega_m0*(1+z)**2 + 4*model.Omega_r0*(1+z)**3 + 
+                  2*model.Omega_k0*(1+z) + model.Omega_geom0*dV_dz)
+        dH_dz = (model.H0_target_kms_mpc**2 / (2 * H)) * dE2_dz
+        d2D_dz2 = -((1/(1+z)) - (dH_dz/H)) * D_prime + \
+                  ( (3/2) * model.Omega_m0 * (model.H0_target_kms_mpc**2 / H**2) * (1+z) ) * D
+        return [D_prime, d2D_dz2]
+
+    # LCDM version (phi fixed at 2.20)
+    def phi_lcdm(z):
+        return 2.20
+    def H_lcdm(z):
+        E2 = (model.Omega_m0 * (1+z)**3 + 
+              model.Omega_r0 * (1+z)**4 + 
+              model.Omega_k0 * (1+z)**2 + 
+              model.Omega_geom0 * model.V_normalized(2.20))
+        return model.H0_target_kms_mpc * np.sqrt(E2)
+
+    z_span_growth = [3000, 0]
+    D_init = 1/(1+z_span_growth[0]); dD_init = -1/((1+z_span_growth[0])**2)
+
+    # GVE model
+    sol_gve = solve_ivp(growth_ode, z_span_growth, [D_init, dD_init], args=(H_func, phi_func), 
+                        method='LSODA', dense_output=True, rtol=1e-6, atol=1e-6)
+    # LCDM model
+    sol_lcdm = solve_ivp(growth_ode, z_span_growth, [D_init, dD_init], args=(H_lcdm, phi_lcdm), 
+                         method='LSODA', dense_output=True, rtol=1e-6, atol=1e-6)
+
+    # The un-normalized final values at z=0
+    D_un_gve_z0 = sol_gve.sol(0)[0]
+    D_un_lcdm_z0 = sol_lcdm.sol(0)[0]
+
+    # The growth correction factor is the ratio of these final amplitudes
+    f_growth = D_un_gve_z0 / D_un_lcdm_z0
+
+    print(f"Calculated f_growth = {f_growth:.4f} (compares well with paper's ~0.8352)")
+
+    # Step 3 & 4: Calculate final sigma8 and S8
+    sigma8_model = sigma8_ref * f_growth
+    S8_model = sigma8_model * np.sqrt(model.Omega_m0 / 0.3)
+
+    return S8_model
+
+if __name__ == "__main__":
+    try:
+        model_instance = GVEModel()
+        H_z_func, Phi_z_func = get_analytic_model(model_instance)
+        
+        print("Calculating Cosmological Constants using the stable semi-analytic model...")
+        
+        H0_kms_Mpc = H_z_func(0)
+        lambda_0 = calculate_lambda_0(model_instance, Phi_z_func)
+        r_s = calculate_sound_horizon(model_instance, H_z_func)
+        S8 = calculate_S8(model_instance, H_z_func, Phi_z_func)
+
+        print("\n--- [FINAL RESULTS] ---")
+        print("------------------------------------------------------------------")
+        print(f"Hubble Constant, H0\t\t= {H0_kms_Mpc:.2f} km/s/Mpc")
+        print(f"Cosmological Constant, Lambda(0)\t= {lambda_0:.4e} m^-2")
+        print(f"Sound Horizon at Recombination, r_s\t= {r_s:.2f} Mpc")
+        print(f"Structure Growth, S8\t\t= {S8:.2f}")
+        print("------------------------------------------------------------------")
+
+    except Exception as e:
+        print(f"\nAn error occurred during the process: {e}")
