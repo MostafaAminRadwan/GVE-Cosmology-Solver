@@ -1,0 +1,759 @@
+"""
+===============================================================================
+SCALING ANALYSIS - Complete Package
+===============================================================================
+Runs simulations for N = [10, 12, 14, 16, 18] with 100 realizations each
+Generates η(N) saturation curves and comprehensive figures
+
+Author: Dr. Moustafa Amin Radwan
+Date: October 2025
+Version: 8.0 (Scaling Analysis)
+===============================================================================
+"""
+
+import numpy as np
+from scipy.sparse import kron, csr_matrix, eye as sparse_eye
+from scipy.sparse.linalg import expm_multiply, eigsh
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from dataclasses import dataclass, field
+import time
+import pickle
+from typing import Dict, Tuple, List
+import warnings
+import gc
+
+warnings.filterwarnings('ignore')
+
+plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.unicode_minus'] = False
+
+# ===============================================================================
+# CONFIGURATION
+# ===============================================================================
+
+@dataclass
+class ScalingConfig:
+    """Configuration for scaling analysis."""
+    
+    # SCALING SIZES - THIS IS WHAT YOU NEED!
+    scaling_sizes: List[int] = field(default_factory=lambda: [10, 12, 14, 16, 18])
+    
+    # Base parameters
+    mu: float = 0.5
+    t: float = 1.0
+    delta: float = 1.0
+    
+    # Multi-component noise (NO DECOHERENCE!)
+    use_decoherence: bool = False  # ← TURNED OFF!
+    
+    noise_1f_amplitude: float = 0.15
+    noise_white_amplitude: float = 0.05
+    noise_telegraph_amplitude: float = 0.03
+    noise_lorentzian_amplitude: float = 0.02
+    spatial_modulation_alpha: float = 0.3
+    
+    noise_frequencies: int = 100
+    f_min: float = 0.1
+    f_max: float = 10.0
+    noise_exponent: float = 1.0
+    
+    telegraph_rate: float = 2.0
+    lorentzian_f0: float = 2.0
+    lorentzian_gamma: float = 0.5
+    
+    # Control parameters
+    measurement_error: float = 0.15
+    control_latency_steps: int = 3
+    
+    # Time evolution
+    t_max: float = 50.0
+    dt: float = 0.1
+    
+    # Statistics
+    n_realizations: int = 100
+    checkpoint_interval: int = 10
+    
+    hbar: float = 1.0
+
+config = ScalingConfig()
+
+print("=" * 80)
+print("SCALING ANALYSIS - Complete Package")
+print("=" * 80)
+print(f"\n🔬 CONFIGURATION:")
+print(f"  System sizes: N ∈ {config.scaling_sizes}")
+print(f"  Realizations per N: {config.n_realizations}")
+print(f"  Total simulations: {len(config.scaling_sizes) * config.n_realizations}")
+print(f"\n  Multi-component noise: 1/f + White + Telegraph + Lorentzian")
+print(f"  Decoherence: {'ENABLED' if config.use_decoherence else 'DISABLED'} ← No T1/T2!")
+print(f"\n⏱️  ESTIMATED TIME:")
+for N in config.scaling_sizes:
+    time_per_real = 3 * (2**N / 2**14) * 60  # Scale from N=14 baseline
+    total_time = time_per_real * config.n_realizations / 3600
+    print(f"    N={N:2d}: ~{total_time:4.1f} hours ({time_per_real/60:4.1f} min/realization)")
+total_estimate = sum([3 * (2**N / 2**14) * 60 * config.n_realizations / 3600 
+                     for N in config.scaling_sizes])
+print(f"    TOTAL: ~{total_estimate:4.1f} hours")
+
+# ===============================================================================
+# PAULI MATRICES
+# ===============================================================================
+
+sigma_x = csr_matrix(np.array([[0, 1], [1, 0]], dtype=complex))
+sigma_y = csr_matrix(np.array([[0, -1j], [1j, 0]], dtype=complex))
+sigma_z = csr_matrix(np.array([[1, 0], [0, -1]], dtype=complex))
+sigma_plus = csr_matrix(0.5 * (sigma_x + 1j * sigma_y))
+sigma_minus = csr_matrix(0.5 * (sigma_x - 1j * sigma_y))
+identity_2 = sparse_eye(2, format='csr', dtype=complex)
+
+# ===============================================================================
+# NOISE GENERATION (same as before)
+# ===============================================================================
+
+def generate_1f_noise(t_max, dt, f_min, f_max, n_freq, amplitude, exponent=1.0, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    n_steps = int(t_max / dt)
+    t_array = np.linspace(0, t_max, n_steps)
+    frequencies = np.logspace(np.log10(f_min), np.log10(f_max), n_freq)
+    amplitudes = 1.0 / (frequencies ** exponent)
+    amplitudes /= np.sum(amplitudes)
+    phases = np.random.uniform(0, 2*np.pi, n_freq)
+    omega = 2 * np.pi * frequencies[:, np.newaxis]
+    time_grid = t_array[np.newaxis, :]
+    phase_grid = phases[:, np.newaxis]
+    B_t = np.sum(amplitudes[:, np.newaxis] * np.sin(omega * time_grid + phase_grid), axis=0)
+    B_t = B_t * (amplitude / (np.std(B_t) + 1e-10))
+    return B_t
+
+def generate_white_noise(t_max, dt, amplitude, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    n_steps = int(t_max / dt)
+    return np.random.normal(0, amplitude, n_steps)
+
+def generate_telegraph_noise(t_max, dt, amplitude, rate, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    n_steps = int(t_max / dt)
+    state = np.random.choice([-1, 1])
+    signal = np.zeros(n_steps)
+    current_time = 0
+    i = 0
+    while current_time < t_max and i < n_steps:
+        dt_switch = np.random.exponential(1.0 / rate)
+        current_time += dt_switch
+        i_switch = min(int(current_time / dt), n_steps)
+        signal[i:i_switch] = state
+        i = i_switch
+        state = -state
+    signal[i:] = state
+    return amplitude * signal
+
+def generate_lorentzian_noise(t_max, dt, amplitude, f0, gamma, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    n_steps = int(t_max / dt)
+    freqs = np.fft.fftfreq(n_steps, dt)
+    S_f = gamma / ((freqs - f0)**2 + gamma**2)
+    S_f += gamma / ((freqs + f0)**2 + gamma**2)
+    S_f = np.sqrt(S_f)
+    phases = np.random.uniform(0, 2*np.pi, n_steps)
+    spectrum = S_f * np.exp(1j * phases)
+    signal = np.fft.ifft(spectrum).real
+    signal = signal * (amplitude / (np.std(signal) + 1e-10))
+    return signal
+
+def generate_multi_component_noise(n_sites, t_max, dt, config, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+    
+    n_steps = int(t_max / dt)
+    
+    B_1f = generate_1f_noise(t_max, dt, config.f_min, config.f_max,
+                             config.noise_frequencies, config.noise_1f_amplitude,
+                             config.noise_exponent, seed=seed)
+    B_white = generate_white_noise(t_max, dt, config.noise_white_amplitude, seed=seed+1000)
+    B_telegraph = generate_telegraph_noise(t_max, dt, config.noise_telegraph_amplitude,
+                                          config.telegraph_rate, seed=seed+2000)
+    B_lorentzian = generate_lorentzian_noise(t_max, dt, config.noise_lorentzian_amplitude,
+                                             config.lorentzian_f0, config.lorentzian_gamma, 
+                                             seed=seed+3000)
+    
+    B_global = B_1f + B_white + B_telegraph + B_lorentzian
+    
+    g_j = np.array([1 + config.spatial_modulation_alpha * np.sin(2*np.pi*j/n_sites) 
+                    for j in range(n_sites)])
+    
+    epsilon_j = np.zeros((n_sites, n_steps))
+    for j in range(n_sites):
+        eps_1f = generate_1f_noise(t_max, dt, config.f_min, config.f_max,
+                                   config.noise_frequencies, config.noise_1f_amplitude * 0.3,
+                                   config.noise_exponent, seed=seed+j+10000)
+        eps_white = generate_white_noise(t_max, dt, config.noise_white_amplitude * 0.5, 
+                                        seed=seed+j+20000)
+        epsilon_j[j, :] = eps_1f + eps_white
+    
+    B_j_t = np.zeros((n_sites, n_steps))
+    for j in range(n_sites):
+        B_j_t[j, :] = g_j[j] * B_global + epsilon_j[j, :]
+    
+    return {
+        'B_global': B_global,
+        'B_1f': B_1f,
+        'B_white': B_white,
+        'B_telegraph': B_telegraph,
+        'B_lorentzian': B_lorentzian,
+        'g_j': g_j,
+        'epsilon_j': epsilon_j,
+        'B_j_t': B_j_t,
+        't_array': np.linspace(0, t_max, n_steps)
+    }
+
+# ===============================================================================
+# OPERATORS
+# ===============================================================================
+
+def get_site_operator_sparse(op, site, n_sites):
+    if site == 0:
+        result = op
+    else:
+        result = identity_2
+    for i in range(1, n_sites):
+        if i == site:
+            result = kron(result, op, format='csr')
+        else:
+            result = kron(result, identity_2, format='csr')
+    return result
+
+def construct_kitaev_hamiltonian_sparse(n_sites, mu, t, delta):
+    dim = 2 ** n_sites
+    H = csr_matrix((dim, dim), dtype=complex)
+    for j in range(n_sites):
+        H = H + (-mu) * get_site_operator_sparse(sigma_z, j, n_sites)
+    for j in range(n_sites - 1):
+        sigma_plus_j = get_site_operator_sparse(sigma_plus, j, n_sites)
+        sigma_minus_jp1 = get_site_operator_sparse(sigma_minus, j+1, n_sites)
+        H = H + (-t) * (sigma_plus_j @ sigma_minus_jp1 + 
+                        sigma_minus_jp1.conj().T @ sigma_plus_j.conj().T)
+    for j in range(n_sites - 1):
+        sigma_plus_j = get_site_operator_sparse(sigma_plus, j, n_sites)
+        sigma_plus_jp1 = get_site_operator_sparse(sigma_plus, j+1, n_sites)
+        H = H + delta * (sigma_plus_j @ sigma_plus_jp1 + 
+                        sigma_plus_jp1.conj().T @ sigma_plus_j.conj().T)
+    return H
+
+def construct_noise_operators(n_sites):
+    return [get_site_operator_sparse(sigma_x, j, n_sites) for j in range(n_sites)]
+
+def construct_control_operator(n_sites):
+    dim = 2 ** n_sites
+    control_op = csr_matrix((dim, dim), dtype=complex)
+    for j in range(n_sites):
+        control_op = control_op + get_site_operator_sparse(sigma_x, j, n_sites)
+    return control_op
+
+def construct_parity_operator(n_sites):
+    dim = 2 ** n_sites
+    P = sparse_eye(dim, format='csr', dtype=complex)
+    for j in range(n_sites):
+        P = P @ get_site_operator_sparse(sigma_z, j, n_sites)
+    return P
+
+# ===============================================================================
+# INITIAL STATES
+# ===============================================================================
+
+def prepare_initial_states(n_sites, mu, t, delta, verbose=True):
+    if verbose:
+        print(f"    [Computing ground states for N={n_sites}...]", end=" ", flush=True)
+    start = time.time()
+    
+    psi_bare = np.array([1, 1], dtype=complex) / np.sqrt(2)
+    H_kitaev_sparse = construct_kitaev_hamiltonian_sparse(n_sites, mu, t, delta)
+    eigenvalues, eigenvectors = eigsh(H_kitaev_sparse, k=10, which='SA', 
+                                      maxiter=10000, tol=1e-8)
+    idx = np.argsort(eigenvalues)
+    eigenvalues = eigenvalues[idx]
+    eigenvectors = eigenvectors[:, idx]
+    
+    P = construct_parity_operator(n_sites)
+    parities = []
+    for i in range(min(10, len(eigenvalues))):
+        psi = eigenvectors[:, i]
+        parity_val = np.real((psi.conj() @ (P @ psi)))
+        parities.append(parity_val)
+    
+    even_indices = [i for i, p in enumerate(parities) if p > 0.5]
+    odd_indices = [i for i, p in enumerate(parities) if p < -0.5]
+    
+    if len(even_indices) == 0 or len(odd_indices) == 0:
+        psi_even = eigenvectors[:, 0]
+        psi_odd = eigenvectors[:, 1]
+    else:
+        psi_even = eigenvectors[:, even_indices[0]]
+        psi_odd = eigenvectors[:, odd_indices[0]]
+    
+    psi_kitaev_logical = (psi_even + psi_odd) / np.sqrt(2)
+    
+    elapsed = time.time() - start
+    if verbose:
+        print(f"Done in {elapsed:.1f}s")
+        gap = abs(eigenvalues[odd_indices[0]] - eigenvalues[even_indices[0]])
+        print(f"      Gap: ΔE={gap:.4f}")
+    
+    info = {
+        'E_even': eigenvalues[even_indices[0]],
+        'E_odd': eigenvalues[odd_indices[0]],
+        'gap': abs(eigenvalues[odd_indices[0]] - eigenvalues[even_indices[0]]),
+        'psi_even': psi_even,
+        'psi_odd': psi_odd,
+        'eigenvalues': eigenvalues[:10]
+    }
+    
+    gc.collect()
+    return psi_bare, psi_kitaev_logical, info
+
+# ===============================================================================
+# LOGICAL FIDELITY
+# ===============================================================================
+
+def calculate_logical_fidelity(psi_ideal, psi_actual, psi_even, psi_odd):
+    c_even_ideal = np.vdot(psi_even, psi_ideal)
+    c_odd_ideal = np.vdot(psi_odd, psi_ideal)
+    c_even_actual = np.vdot(psi_even, psi_actual)
+    c_odd_actual = np.vdot(psi_odd, psi_actual)
+    
+    norm_ideal = np.sqrt(np.abs(c_even_ideal)**2 + np.abs(c_odd_ideal)**2)
+    norm_actual = np.sqrt(np.abs(c_even_actual)**2 + np.abs(c_odd_actual)**2)
+    
+    if norm_ideal < 1e-10 or norm_actual < 1e-10:
+        return 0.0
+    
+    c_even_ideal /= norm_ideal
+    c_odd_ideal /= norm_ideal
+    c_even_actual /= norm_actual
+    c_odd_actual /= norm_actual
+    
+    overlap = c_even_ideal.conj() * c_even_actual + c_odd_ideal.conj() * c_odd_actual
+    return np.abs(overlap)**2
+
+# ===============================================================================
+# TIME EVOLUTION
+# ===============================================================================
+
+def evolve_with_noise(psi_init, H_system, noise_operators, control_operator,
+                     noise_data, control_type='none', config=None,
+                     psi_even=None, psi_odd=None):
+    if config is None:
+        config = ScalingConfig()
+    
+    t_array = noise_data['t_array']
+    B_j_t = noise_data['B_j_t']
+    B_global = noise_data['B_global']
+    n_sites = B_j_t.shape[0]
+    
+    n_steps = len(t_array)
+    dt = t_array[1] - t_array[0]
+    
+    psi_actual = psi_init.copy()
+    psi_ideal = psi_init.copy()
+    fidelities = np.zeros(n_steps)
+    noise_history = np.zeros(n_steps)
+    
+    U_ideal_H = -1j * H_system * dt / config.hbar
+    use_logical = (psi_even is not None and psi_odd is not None)
+    
+    for i in range(n_steps):
+        noise_global = B_global[i]
+        noise_history[i] = noise_global
+        
+        if control_type == 'none':
+            control = 0.0
+        elif control_type == 'perfect':
+            control = -noise_global
+        elif control_type == 'realistic':
+            measured_noise = noise_global + np.random.normal(
+                0, config.measurement_error * config.noise_1f_amplitude
+            )
+            if i >= config.control_latency_steps:
+                past_noise = noise_history[i - config.control_latency_steps]
+                control = -past_noise + np.random.normal(
+                    0, config.measurement_error * config.noise_1f_amplitude
+                )
+            else:
+                control = 0.0
+        
+        H_total = H_system.copy()
+        for j in range(n_sites):
+            H_total = H_total + B_j_t[j, i] * noise_operators[j]
+        if control != 0:
+            H_total = H_total + control * control_operator
+        
+        U_actual_H = -1j * H_total * dt / config.hbar
+        psi_actual = expm_multiply(U_actual_H, psi_actual)
+        psi_ideal = expm_multiply(U_ideal_H, psi_ideal)
+        
+        if use_logical:
+            fidelities[i] = calculate_logical_fidelity(psi_ideal, psi_actual, 
+                                                       psi_even, psi_odd)
+        else:
+            fidelities[i] = np.abs(np.vdot(psi_ideal, psi_actual))**2
+    
+    return fidelities
+
+# ===============================================================================
+# SINGLE REALIZATION
+# ===============================================================================
+
+def run_single_realization(n_sites, config, seed=None, verbose=False):
+    noise_data = generate_multi_component_noise(n_sites, config.t_max, config.dt,
+                                                config, seed=seed)
+    psi_bare, psi_kitaev, info = prepare_initial_states(n_sites, config.mu, 
+                                                        config.t, config.delta, 
+                                                        verbose=verbose)
+    
+    H_bare = -config.mu * sigma_z
+    H_kitaev = construct_kitaev_hamiltonian_sparse(n_sites, config.mu, config.t, config.delta)
+    
+    noise_ops_bare = [sigma_x]
+    control_op_bare = sigma_x
+    noise_ops_kitaev = construct_noise_operators(n_sites)
+    control_op_kitaev = construct_control_operator(n_sites)
+    
+    noise_data_bare = {
+        't_array': noise_data['t_array'],
+        'B_j_t': noise_data['B_global'].reshape(1, -1),
+        'B_global': noise_data['B_global']
+    }
+    
+    results = {}
+    psi_even = info['psi_even']
+    psi_odd = info['psi_odd']
+    
+    results['1. Bare (No Protection)'] = evolve_with_noise(
+        psi_bare, H_bare, noise_ops_bare, control_op_bare,
+        noise_data_bare, control_type='none', config=config
+    )
+    
+    results['2. Bare + Perfect Control'] = evolve_with_noise(
+        psi_bare, H_bare, noise_ops_bare, control_op_bare,
+        noise_data_bare, control_type='perfect', config=config
+    )
+    
+    results['3. Bare + Realistic Control'] = evolve_with_noise(
+        psi_bare, H_bare, noise_ops_bare, control_op_bare,
+        noise_data_bare, control_type='realistic', config=config
+    )
+    
+    results['4. Topological (Passive)'] = evolve_with_noise(
+        psi_kitaev, H_kitaev, noise_ops_kitaev, control_op_kitaev,
+        noise_data, control_type='none', config=config,
+        psi_even=psi_even, psi_odd=psi_odd
+    )
+    
+    results['5. Topological + Perfect Control'] = evolve_with_noise(
+        psi_kitaev, H_kitaev, noise_ops_kitaev, control_op_kitaev,
+        noise_data, control_type='perfect', config=config,
+        psi_even=psi_even, psi_odd=psi_odd
+    )
+    
+    results['6. Hybrid (Topological + Realistic)'] = evolve_with_noise(
+        psi_kitaev, H_kitaev, noise_ops_kitaev, control_op_kitaev,
+        noise_data, control_type='realistic', config=config,
+        psi_even=psi_even, psi_odd=psi_odd
+    )
+    
+    gc.collect()
+    return results, noise_data, info
+
+# ===============================================================================
+# ENSEMBLE SIMULATION
+# ===============================================================================
+
+def run_ensemble(n_sites, config, n_realizations=None):
+    if n_realizations is None:
+        n_realizations = config.n_realizations
+    
+    print(f"\n{'='*80}")
+    print(f"ENSEMBLE: N={n_sites}, {n_realizations} realizations")
+    print(f"{'='*80}")
+    
+    all_results = {scenario: [] for scenario in [
+        '1. Bare (No Protection)',
+        '2. Bare + Perfect Control',
+        '3. Bare + Realistic Control',
+        '4. Topological (Passive)',
+        '5. Topological + Perfect Control',
+        '6. Hybrid (Topological + Realistic)'
+    ]}
+    
+    t_array = None
+    sample_noise = None
+    info = None
+    
+    start_time = time.time()
+    
+    for i in range(n_realizations):
+        iter_start = time.time()
+        
+        results, noise_data, inf = run_single_realization(
+            n_sites, config, seed=42+i, verbose=(i == 0)
+        )
+        
+        for scenario, fidelity in results.items():
+            all_results[scenario].append(fidelity)
+        
+        if i == 0:
+            t_array = noise_data['t_array']
+            sample_noise = noise_data
+            info = inf
+        
+        iter_time = time.time() - iter_start
+        elapsed = time.time() - start_time
+        avg_time = elapsed / (i+1)
+        eta = avg_time * (n_realizations - i - 1)
+        
+        if (i+1) % 5 == 0 or i == 0:
+            print(f"  [{i+1:3d}/{n_realizations}] "
+                  f"Time: {iter_time:5.1f}s | "
+                  f"Elapsed: {elapsed/60:5.1f}m | "
+                  f"ETA: {eta/60:5.1f}m")
+        
+        if (i+1) % config.checkpoint_interval == 0:
+            checkpoint_data = {
+                'results': all_results,
+                't_array': t_array,
+                'sample_noise': sample_noise,
+                'info': info,
+                'n_completed': i+1
+            }
+            checkpoint_file = f'checkpoint_scaling_N{n_sites}_r{i+1}.pkl'
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            print(f"    [CHECKPOINT: {checkpoint_file}]")
+    
+    total_time = time.time() - start_time
+    print(f"\n  [DONE N={n_sites}] Total: {total_time/60:.1f} min")
+    
+    ensemble_stats = {}
+    for scenario, fidelities_list in all_results.items():
+        fidelities_array = np.array(fidelities_list)
+        ensemble_stats[scenario] = {
+            'mean': np.mean(fidelities_array, axis=0),
+            'std': np.std(fidelities_array, axis=0),
+            'sem': np.std(fidelities_array, axis=0) / np.sqrt(n_realizations),
+            'final_mean': np.mean(fidelities_array[:, -1]),
+            'final_sem': np.std(fidelities_array[:, -1]) / np.sqrt(n_realizations),
+        }
+    
+    return {
+        'stats': ensemble_stats,
+        't_array': t_array,
+        'sample_noise': sample_noise,
+        'info': info,
+        'n_sites': n_sites
+    }
+
+# ===============================================================================
+# SCALING ANALYSIS PLOTS
+# ===============================================================================
+
+def plot_scaling_results(scaling_data, config):
+    """Generate comprehensive scaling analysis figures."""
+    
+    print("\n[PLOT] Generating scaling analysis figures...")
+    
+    # ========== Figure 1: Fidelity vs Time for all N ==========
+    fig1, ax1 = plt.subplots(figsize=(12, 8))
+    
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, len(config.scaling_sizes)))
+    
+    for i, N in enumerate(config.scaling_sizes):
+        data = scaling_data[N]
+        t_array = data['t_array']
+        hybrid_mean = data['stats']['6. Hybrid (Topological + Realistic)']['mean']
+        hybrid_sem = data['stats']['6. Hybrid (Topological + Realistic)']['sem']
+        
+        ax1.plot(t_array, hybrid_mean, label=f'N = {N}',
+                color=colors[i], linewidth=3, alpha=0.9)
+        ax1.fill_between(t_array, hybrid_mean - 2*hybrid_sem, 
+                        hybrid_mean + 2*hybrid_sem,
+                        color=colors[i], alpha=0.15)
+    
+    ax1.set_xlabel('Time', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Fidelity F(t)', fontsize=14, fontweight='bold')
+    ax1.set_title('Hybrid Strategy: System Size Scaling\n'
+                 'Multi-Component Noise + Logical Fidelity',
+                 fontsize=16, fontweight='bold')
+    ax1.legend(fontsize=12, loc='lower left', framealpha=0.95)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, config.t_max)
+    ax1.set_ylim(0, 1.05)
+    
+    plt.tight_layout()
+    plt.savefig('figure_scaling_fidelity_vs_time.png', dpi=300, bbox_inches='tight')
+    plt.savefig('figure_scaling_fidelity_vs_time.pdf', bbox_inches='tight')
+    print("  [SAVED] figure_scaling_fidelity_vs_time.png/pdf")
+    plt.close()
+    
+    # ========== Figure 2: Enhancement Factor η(N) ==========
+    fig2, (ax2a, ax2b) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    N_values = []
+    eta_values = []
+    eta_errors = []
+    gaps = []
+    
+    F_hybrid_values = []
+    F_topo_values = []
+    F_bare_values = []
+    
+    for N in config.scaling_sizes:
+        data = scaling_data[N]
+        
+        F_hybrid = data['stats']['6. Hybrid (Topological + Realistic)']['final_mean']
+        F_topo = data['stats']['4. Topological (Passive)']['final_mean']
+        F_bare = data['stats']['1. Bare (No Protection)']['final_mean']
+        
+        eta = F_hybrid / F_topo if F_topo > 0 else 0
+        
+        # Error propagation
+        sem_hybrid = data['stats']['6. Hybrid (Topological + Realistic)']['final_sem']
+        sem_topo = data['stats']['4. Topological (Passive)']['final_sem']
+        eta_error = eta * np.sqrt((sem_hybrid/F_hybrid)**2 + (sem_topo/F_topo)**2)
+        
+        N_values.append(N)
+        eta_values.append(eta)
+        eta_errors.append(eta_error)
+        gaps.append(data['info']['gap'])
+        
+        F_hybrid_values.append(F_hybrid)
+        F_topo_values.append(F_topo)
+        F_bare_values.append(F_bare)
+    
+    # Plot η(N)
+    ax2a.errorbar(N_values, eta_values, yerr=eta_errors, 
+                 fmt='o-', color='#1f77b4', linewidth=3, 
+                 markersize=12, capsize=5, capthick=2, alpha=0.9)
+    
+    # Saturation line
+    if len(eta_values) >= 3:
+        eta_sat = np.mean(eta_values[-2:])
+        ax2a.axhline(eta_sat, color='red', linestyle='--', 
+                    linewidth=2, alpha=0.7,
+                    label=f'Saturation: η ≈ {eta_sat:.2f}')
+    
+    ax2a.set_xlabel('System Size N', fontsize=14, fontweight='bold')
+    ax2a.set_ylabel('Enhancement Factor η(N)', fontsize=14, fontweight='bold')
+    ax2a.set_title('Hybrid Advantage vs System Size\n'
+                   'η(N) = F_hybrid(50) / F_topo(50)',
+                   fontsize=14, fontweight='bold')
+    ax2a.legend(fontsize=12, framealpha=0.95)
+    ax2a.grid(True, alpha=0.3)
+    ax2a.set_xlim(min(N_values)-1, max(N_values)+1)
+    
+    # Plot Final Fidelities
+    width = 0.8
+    x_pos = np.arange(len(N_values))
+    
+    ax2b.plot(N_values, F_bare_values, 'o-', label='Bare', 
+             color='#d62728', linewidth=2.5, markersize=10, alpha=0.9)
+    ax2b.plot(N_values, F_topo_values, 's-', label='Topological', 
+             color='#2ca02c', linewidth=2.5, markersize=10, alpha=0.9)
+    ax2b.plot(N_values, F_hybrid_values, '^-', label='Hybrid', 
+             color='#1f77b4', linewidth=3, markersize=12, alpha=0.9)
+    
+    ax2b.set_xlabel('System Size N', fontsize=14, fontweight='bold')
+    ax2b.set_ylabel('Final Fidelity F(t=50)', fontsize=14, fontweight='bold')
+    ax2b.set_title('Protection Strategy Performance vs N',
+                   fontsize=14, fontweight='bold')
+    ax2b.legend(fontsize=12, framealpha=0.95)
+    ax2b.grid(True, alpha=0.3)
+    ax2b.set_xlim(min(N_values)-1, max(N_values)+1)
+    ax2b.set_ylim(0, 1.05)
+    
+    plt.tight_layout()
+    plt.savefig('figure_scaling_eta_and_fidelities.png', dpi=300, bbox_inches='tight')
+    plt.savefig('figure_scaling_eta_and_fidelities.pdf', bbox_inches='tight')
+    print("  [SAVED] figure_scaling_eta_and_fidelities.png/pdf")
+    plt.close()
+    
+    # ========== Print Summary Table ==========
+    print("\n" + "="*80)
+    print("SCALING ANALYSIS SUMMARY")
+    print("="*80)
+    print(f"\n{'N':>4} | {'Gap':>8} | {'F_bare':>7} | {'F_topo':>7} | "
+          f"{'F_hybrid':>7} | {'η':>6} | {'Improvement':>12}")
+    print("-"*80)
+    for i, N in enumerate(N_values):
+        print(f"{N:4d} | {gaps[i]:8.4f} | {F_bare_values[i]:7.3f} | "
+              f"{F_topo_values[i]:7.3f} | {F_hybrid_values[i]:7.3f} | "
+              f"{eta_values[i]:6.2f} | "
+              f"{100*(F_hybrid_values[i]/F_bare_values[i]-1):+11.1f}%")
+    print("="*80)
+
+# ===============================================================================
+# MAIN EXECUTION
+# ===============================================================================
+
+def main():
+    """Main scaling analysis execution."""
+    overall_start = time.time()
+    
+    print("\n" + "="*80)
+    print("STARTING SCALING ANALYSIS")
+    print("="*80)
+    
+    scaling_results = {}
+    
+    # Run for each N
+    for N in config.scaling_sizes:
+        print(f"\n{'#'*80}")
+        print(f"# SYSTEM SIZE: N = {N}")
+        print(f"{'#'*80}")
+        
+        data = run_ensemble(N, config)
+        scaling_results[N] = data
+        
+        # Save after each N
+        with open(f'scaling_data_N{N}.pkl', 'wb') as f:
+            pickle.dump(data, f)
+        print(f"\n  [SAVED] scaling_data_N{N}.pkl")
+        
+        # Print quick summary
+        stats = data['stats']
+        print(f"\n  RESULTS for N={N}:")
+        print(f"    Bare:        {stats['1. Bare (No Protection)']['final_mean']:.3f}")
+        print(f"    Topological: {stats['4. Topological (Passive)']['final_mean']:.3f}")
+        print(f"    Hybrid:      {stats['6. Hybrid (Topological + Realistic)']['final_mean']:.3f}")
+    
+    # Save complete scaling data
+    complete_data = {
+        'scaling_results': scaling_results,
+        'config': config
+    }
+    with open('scaling_analysis_complete.pkl', 'wb') as f:
+        pickle.dump(complete_data, f)
+    print(f"\n[SAVED] scaling_analysis_complete.pkl")
+    
+    # Generate plots
+    plot_scaling_results(scaling_results, config)
+    
+    total_time = time.time() - overall_start
+    
+    print("\n" + "="*80)
+    print("SCALING ANALYSIS COMPLETE!")
+    print("="*80)
+    print(f"\n  Total time: {total_time/3600:.2f} hours ({total_time/60:.1f} minutes)")
+    print(f"\n  Files generated:")
+    print(f"    - scaling_data_N*.pkl (individual N)")
+    print(f"    - scaling_analysis_complete.pkl (all data)")
+    print(f"    - figure_scaling_fidelity_vs_time.png/pdf")
+    print(f"    - figure_scaling_eta_and_fidelities.png/pdf")
+    print("\n" + "="*80 + "\n")
+
+if __name__ == "__main__":
+    main()
