@@ -1,0 +1,102 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+plt.rcParams.update({
+    'font.size': 11, 'font.family': 'serif', 'axes.labelsize': 12,
+    'axes.titlesize': 13, 'legend.fontsize': 10, 'lines.linewidth': 2.5,
+    'figure.dpi': 150, 'savefig.dpi': 300
+})
+
+data_dir = Path('./data')
+
+def load_and_normalize(filename):
+    full_path = data_dir / filename
+    
+    if not full_path.exists():
+        raise FileNotFoundError(f": {full_path}")
+
+    data = np.load(full_path)
+    time = data['time']
+    
+    purity_raw = data['purity']
+    p0 = purity_raw[0]
+    purity = purity_raw / p0 
+    
+    entropy = data['entropy']
+    entropy = entropy - entropy[0]
+    
+    return time, purity, entropy, data['coupling']
+
+
+print("Figure 1...")
+try:
+    # تحميل بيانات c=1.5
+    t, p, s, c = load_and_normalize('simulation_c1.5.npz')
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Purity
+    ax1.plot(t, p, 'b-', label=f'Coupling c={c}')
+    ax1.axhline(0.5, color='r', linestyle=':', label='Maximally Mixed (0.5)')
+    ax1.set_xlabel('Time (a.u.)')
+    ax1.set_ylabel('Purity $Tr(\\rho^2)$')
+    ax1.set_title('(a) System Purity Decay (Corrected)')
+    ax1.set_ylim(0, 1.1) #  0  1
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Entropy
+    ax2.plot(t, s, 'g-')
+    ax2.set_xlabel('Time (a.u.)')
+    ax2.set_ylabel('Von Neumann Entropy')
+    ax2.set_title('(b) Entropy Growth')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('figure1_CORRECTED.png')
+    plt.savefig('figure1_CORRECTED.pdf')
+    print("✅  figure1_CORRECTED ")
+
+except Exception as e:
+    print(f"❌ Figure 1: {e}")
+
+
+print("\n Figure 2...")
+try:
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    files = ['simulation_c0.1.npz', 'simulation_c0.3.npz', 'simulation_c0.5.npz', 'simulation_c1.5.npz']
+    colors = plt.cm.viridis(np.linspace(0, 1, len(files)))
+    
+    found_any = False
+    for i, f in enumerate(files):
+        try:
+            t, p, s, c_val = load_and_normalize(f)
+            label = f'c = {c_val}'
+            if c_val == 1.5: label += ' (Strong)'
+            ax.plot(t, p, color=colors[i], label=label)
+            found_any = True
+        except FileNotFoundError:
+            print(f"⚠️ ")
+        except Exception as e:
+            print(f"⚠️ ")
+
+    if found_any:
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Normalized Purity')
+        ax.set_title('Purity Decay vs Coupling Strength')
+        ax.set_ylim(0, 1.1)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        plt.savefig('figure2_CORRECTED.png')
+        plt.savefig('figure2_CORRECTED.pdf')
+        print("✅  figure2_CORRECTED ")
+    else:
+        print("❌ ")
+
+except Exception as e:
+    print(f"❌ Figure 2: {e}")
+
+print("\n")
