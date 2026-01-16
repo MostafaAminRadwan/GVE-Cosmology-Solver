@@ -1,0 +1,106 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fftpack import fft, ifft, fftfreq
+from scipy.ndimage import gaussian_filter1d
+
+# ==========================================
+# إعدادات المحاكاة (مطابقة تماماً لـ c=1.5)
+# ==========================================
+m_s = 1.0; m_e = 2.0; x0 = 3.0; omega = 0.8
+V0 = 10.0; hbar = 1.0; c = 1.5  # Strong Coupling
+N = 128; N_env = 64; L = 20.0
+dx = L / N; dt = 0.05; t_max = 20.0
+
+x = np.linspace(-L/2, L/2, N)
+x_env = np.linspace(-L/2, L/2, N_env)
+X_S, X_E = np.meshgrid(x, x_env, indexing='ij')
+
+# Potentials
+V_sys = V0 * (1 - (X_S / x0)**2)**2
+V_env = 0.5 * m_e * omega**2 * X_E**2
+V_int = c * X_S * X_E
+V_total = V_sys + V_env + V_int
+
+# Evolution Operators
+kx = 2 * np.pi * fftfreq(N, d=dx)
+kx_env = 2 * np.pi * fftfreq(N_env, d=dx)
+K_sys = np.exp(-1j * hbar * (kx**2 / (2*m_s)) * dt)
+K_env = np.exp(-1j * hbar * (kx_env**2 / (2*m_e)) * dt)
+
+# ==========================================
+# Initial State (التصحيح هنا)
+# ==========================================
+sigma_s = 1.5; sigma_e = 1.0
+# نقوم بتحويلها لـ complex فوراً لتجنب الخطأ
+psi = (np.exp(-X_S**2/(2*sigma_s**2)) * np.exp(-X_E**2/(2*sigma_e**2))).astype(complex)
+psi /= np.sqrt(np.sum(np.abs(psi)**2) * dx**2)
+
+# ==========================================
+# دالة حساب الجهد الكمي (Quantum Potential)
+# ==========================================
+def calculate_Q_effective(psi_current):
+    # 1. حساب الدالة الموجية المختزلة للنظام
+    prob_density = np.sum(np.abs(psi_current)**2, axis=1)
+    # تنعيم لتجنب الضوضاء الرقمية في الاشتقاق
+    prob_smooth = gaussian_filter1d(prob_density, sigma=1)
+    R = np.sqrt(prob_smooth + 1e-10) # R amplitude
+    
+    # 2. حساب المشتقة الثانية لـ R
+    R_prime2 = np.gradient(np.gradient(R, dx), dx)
+    Q = -(hbar**2 / (2*m_s)) * (R_prime2 / R)
+    
+    return Q
+
+# ==========================================
+# حلقة المحاكاة والرسم
+# ==========================================
+times_to_plot = [0.0, 5.0, 15.0]
+snapshots = []
+
+print("جاري تشغيل المحاكاة السريعة لالتقاط صور الجهد الكمي...")
+
+current_plot_idx = 0
+for step in range(int(t_max / dt) + 1):
+    t = step * dt
+    
+    # حفظ اللقطات في الأوقات المحددة
+    if current_plot_idx < len(times_to_plot) and t >= times_to_plot[current_plot_idx]:
+        Q = calculate_Q_effective(psi)
+        snapshots.append((t, Q))
+        print(f"تم التقاط صورة عند t = {t:.1f}")
+        current_plot_idx += 1
+
+    # Propagation (Split-Step)
+    psi *= np.exp(-0.5j * V_total * dt)
+    psi = ifft(K_sys[:, None] * fft(psi, axis=0), axis=0)
+    psi = ifft(K_env[None, :] * fft(psi, axis=1), axis=1)
+    psi *= np.exp(-0.5j * V_total * dt)
+    
+    # Renormalize
+    psi /= np.sqrt(np.sum(np.abs(psi)**2) * dx**2)
+
+# ==========================================
+# الرسم
+# ==========================================
+plt.figure(figsize=(10, 6))
+plt.rcParams.update({'font.size': 12, 'font.family': 'serif'})
+
+colors = ['blue', 'green', 'red']
+styles = ['-', '--', '-.']
+
+for i, (t_val, Q_val) in enumerate(snapshots):
+    # رسم المنطقة المركزية فقط حيث تتواجد الدالة الموجية
+    mask = (x > -6) & (x < 6)
+    plt.plot(x[mask], Q_val[mask], color=colors[i], linestyle=styles[i], 
+             linewidth=2, label=f'Time t = {t_val:.1f}')
+
+plt.title('Evolution of Effective Quantum Potential $Q_{eff}(x_S)$', fontweight='bold')
+plt.xlabel('System Position $x_S$')
+plt.ylabel('Potential Energy (a.u.)')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.ylim(-15, 15)
+
+plt.savefig('quantum_potential_evolution.pdf', bbox_inches='tight')
+plt.savefig('quantum_potential_evolution.png', dpi=300, bbox_inches='tight')
+print("✅ تم حفظ الصورة: quantum_potential_evolution.pdf")
